@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -80,6 +81,9 @@ func main() {
 	handler := enableCors(http.HandlerFunc(orderHandler))
 	http.Handle("/order", handler)
 
+	getOrdersHandlerWithCors := enableCors(http.HandlerFunc(getOrdersHandler))
+	http.Handle("/orders", getOrdersHandlerWithCors)
+
 	log.Printf("Server starting on port %s...", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
@@ -88,7 +92,7 @@ func main() {
 func enableCors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == "OPTIONS" {
@@ -212,4 +216,35 @@ func isValidEmail(email string) bool {
 		}
 	}
 	return false
+}
+
+// Add a GET handler that returns all orders in JSON.
+func getOrdersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Query the database for all orders
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cursor, err := orderColl.Find(ctx, bson.M{})
+	if err != nil {
+		log.Printf("Error finding orders: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var orders []Order
+	if err = cursor.All(ctx, &orders); err != nil {
+		log.Printf("Error decoding orders: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the orders in JSON format
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(orders)
 }
