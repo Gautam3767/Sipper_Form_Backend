@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -36,8 +37,13 @@ type Order struct {
 	PhoneNumber         string             `bson:"phoneNumber" json:"phoneNumber"`
 	Address             string             `bson:"address" json:"address"`
 	CreatedAt           time.Time          `bson:"createdAt" json:"createdAt"`
-	// DeliveryDateTime is the parsed combination of delivery date and time.
-	DeliveryDateTime time.Time `bson:"deliveryDateTime" json:"deliveryDateTime"`
+	DeliveryDateTime    time.Time          `bson:"deliveryDateTime" json:"deliveryDateTime"`
+	Status              string             `bson:"status,omitempty" json:"status,omitempty"`
+}
+
+// StatusUpdate represents a status update request
+type StatusUpdate struct {
+	Status string `json:"status"`
 }
 
 var (
@@ -77,12 +83,11 @@ func main() {
 	// Use a specific database and collection.
 	orderColl = client.Database("orderdb").Collection("orders")
 
-	// Setup HTTP endpoint with CORS middleware.
-	handler := enableCors(http.HandlerFunc(orderHandler))
-	http.Handle("/order", handler)
-
-	getOrdersHandlerWithCors := enableCors(http.HandlerFunc(getOrdersHandler))
-	http.Handle("/orders", getOrdersHandlerWithCors)
+	// Setup HTTP endpoints with CORS middleware.
+	http.Handle("/order", enableCors(http.HandlerFunc(orderHandler)))
+	http.Handle("/orders", enableCors(http.HandlerFunc(getOrdersHandler)))
+	// Use a more generic handler for all paths starting with /orders/
+	http.Handle("/orders/", enableCors(http.HandlerFunc(orderRouteHandler)))
 
 	log.Printf("Server starting on port %s...", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -91,19 +96,225 @@ func main() {
 // enableCors adds CORS headers to the response.
 func enableCors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Allow requests from any origin
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// Allow more HTTP methods including PATCH
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE, PATCH")
+		// Allow additional headers
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// Allow credentials
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		// Set max age for preflight requests
+		w.Header().Set("Access-Control-Max-Age", "3600")
 
+		// Handle preflight OPTIONS requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
 
-// orderHandler processes incoming POST requests with order data.
+// orderRouteHandler handles all routes starting with /orders/
+func orderRouteHandler(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(r.URL.Path, "/")
+
+	// Check if the path has enough parts
+	if len(pathParts) < 3 {
+		http.Error(w, "Invalid URL path", http.StatusBadRequest)
+		return
+	}
+
+	orderId := pathParts[2]
+
+	// Handle /orders/{orderId}/status
+	if len(pathParts) >= 4 && pathParts[3] == "status" {
+		handleOrderStatus(w, r, orderId)
+		return
+	}
+
+	// Handle /orders/{orderId} - for future use
+	if len(pathParts) == 3 {
+		handleSingleOrder(w, r, orderId)
+		return
+	}
+
+	http.Error(w, "Invalid URL path", http.StatusBadRequest)
+}
+
+// handleSingleOrder handles GET and PUT requests for a single order
+func handleSingleOrder(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	switch r.Method {
+	case http.MethodGet:
+		// Get a single order
+		getOrderById(w, r, orderIdStr)
+	case http.MethodPut:
+		// Update an order
+		updateOrder(w, r, orderIdStr)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// getOrderById retrieves a single order by ID
+func getOrderById(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	objectID, err := primitive.ObjectIDFromHex(orderIdStr)
+	if err != nil {
+		http.Error(w, "Invalid order ID", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var order Order
+	err = orderColl.FindOne(ctx, bson.M{"_id": objectID}).Decode(&order)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			http.Error(w, "Order not found", http.StatusNotFound)
+		} else {
+			log.Printf("Error finding order: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(order)
+}
+
+// updateOrder updates an existing order
+func updateOrder(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	objectID, err := primitive.ObjectIDFromHex(orderIdStr)
+	if err != nil {
+		http.Error(w, "Invalid order ID", http.StatusBadRequest)
+		return
+	}
+
+	var updatedOrder Order
+	if err := json.NewDecoder(r.Body).Decode(&updatedOrder); err != nil {
+		http.Error(w, "Invalid JSON data", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Ensure ID is not changed
+	updatedOrder.ID = objectID
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Update the order
+	_, err = orderColl.ReplaceOne(ctx, bson.M{"_id": objectID}, updatedOrder)
+	if err != nil {
+		log.Printf("Error updating order: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedOrder)
+}
+
+// handleOrderStatus handles status updates for an order
+func handleOrderStatus(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	switch r.Method {
+	case http.MethodGet:
+		getOrderStatus(w, r, orderIdStr)
+	case http.MethodPatch:
+		updateOrderStatus(w, r, orderIdStr)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// getOrderStatus retrieves the status of an order
+func getOrderStatus(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	objectID, err := primitive.ObjectIDFromHex(orderIdStr)
+	if err != nil {
+		http.Error(w, "Invalid order ID", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var order Order
+	err = orderColl.FindOne(ctx, bson.M{"_id": objectID}).Decode(&order)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			http.Error(w, "Order not found", http.StatusNotFound)
+		} else {
+			log.Printf("Error finding order: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	status := map[string]string{
+		"orderID": orderIdStr,
+		"status":  order.Status,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// updateOrderStatus updates the status of an order
+func updateOrderStatus(w http.ResponseWriter, r *http.Request, orderIdStr string) {
+	objectID, err := primitive.ObjectIDFromHex(orderIdStr)
+	if err != nil {
+		http.Error(w, "Invalid order ID", http.StatusBadRequest)
+		return
+	}
+
+	var statusUpdate StatusUpdate
+	if err := json.NewDecoder(r.Body).Decode(&statusUpdate); err != nil {
+		http.Error(w, "Invalid JSON data", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if statusUpdate.Status == "" {
+		http.Error(w, "Status cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Update only the status field
+	update := bson.M{
+		"$set": bson.M{"status": statusUpdate.Status},
+	}
+
+	result, err := orderColl.UpdateOne(ctx, bson.M{"_id": objectID}, update)
+	if err != nil {
+		log.Printf("Error updating order status: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if result.MatchedCount == 0 {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+
+	// Get the updated order
+	var updatedOrder Order
+	err = orderColl.FindOne(ctx, bson.M{"_id": objectID}).Decode(&updatedOrder)
+	if err != nil {
+		log.Printf("Error retrieving updated order: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updatedOrder)
+}
+
 func orderHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST is allowed", http.StatusMethodNotAllowed)
@@ -141,6 +352,11 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 	order.CreatedAt = time.Now()
 	order.DeliveryDateTime = deliveryDateTime
 
+	// Set default status
+	if order.Status == "" {
+		order.Status = "scheduled"
+	}
+
 	// Insert the order into MongoDB.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -160,72 +376,12 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// validateOrder checks required fields and validates business logic.
-func validateOrder(o Order) error {
-	if o.ProductType == "" ||
-		o.SubOption == "" ||
-		o.Quantity == "" ||
-		o.Size == "" ||
-		o.DeliveryDate == "" ||
-		o.DeliveryTime == "" ||
-		o.CompanyName == "" ||
-		o.Email == "" ||
-		o.PhoneNumber == "" ||
-		o.Address == "" {
-		return errors.New("missing required fields")
-	}
-
-	// For "Existing Brand" orders, ensure brandName is provided and quantity meets minimum requirements.
-	if o.OrderType == "Existing Brand" {
-		if o.BrandName == "" {
-			return errors.New("brandName is required for Existing Brand orders")
-		}
-		quantity, err := strconv.Atoi(o.Quantity)
-		if err != nil {
-			return errors.New("quantity must be a valid number")
-		}
-		if quantity < 1000 {
-			return errors.New("quantity must be at least 1000 for Existing Brand orders")
-		}
-	}
-
-	// Basic email validation.
-	if !isValidEmail(o.Email) {
-		return errors.New("invalid email format")
-	}
-
-	return nil
-}
-
-// parseDeliveryDateTime combines deliveryDate and deliveryTime into a single time.Time value.
-// Assumes date format "YYYY-MM-DD" and time format "HH:MM".
-func parseDeliveryDateTime(dateStr, timeStr string) (time.Time, error) {
-	layout := "2006-01-02 15:04"
-	combined := fmt.Sprintf("%s %s", dateStr, timeStr)
-	return time.Parse(layout, combined)
-}
-
-// isValidEmail provides a basic check for the presence of "@".
-func isValidEmail(email string) bool {
-	if len(email) < 3 || len(email) > 254 {
-		return false
-	}
-	for _, c := range email {
-		if c == '@' {
-			return true
-		}
-	}
-	return false
-}
-
-// Add a GET handler that returns all orders in JSON.
 func getOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Only GET is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Query the database for all orders
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -244,7 +400,61 @@ func getOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return the orders in JSON format
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(orders)
+}
+
+// validateOrder checks required fields and validates business logic.
+func validateOrder(o Order) error {
+	if o.ProductType == "" ||
+		o.SubOption == "" ||
+		o.Quantity == "" ||
+		o.Size == "" ||
+		o.DeliveryDate == "" ||
+		o.DeliveryTime == "" ||
+		o.CompanyName == "" ||
+		o.Email == "" ||
+		o.PhoneNumber == "" ||
+		o.Address == "" {
+		return errors.New("missing required fields")
+	}
+
+	if o.OrderType == "Existing Brand" {
+		if o.BrandName == "" {
+			return errors.New("brandName is required for Existing Brand orders")
+		}
+		quantity, err := strconv.Atoi(o.Quantity)
+		if err != nil {
+			return errors.New("quantity must be a valid number")
+		}
+		if quantity < 1000 {
+			return errors.New("quantity must be at least 1000 for Existing Brand orders")
+		}
+	}
+
+	if !isValidEmail(o.Email) {
+		return errors.New("invalid email format")
+	}
+
+	return nil
+}
+
+// parseDeliveryDateTime combines deliveryDate and deliveryTime.
+func parseDeliveryDateTime(dateStr, timeStr string) (time.Time, error) {
+	layout := "2006-01-02 15:04"
+	combined := fmt.Sprintf("%s %s", dateStr, timeStr)
+	return time.Parse(layout, combined)
+}
+
+// isValidEmail provides a basic check for "@" presence.
+func isValidEmail(email string) bool {
+	if len(email) < 3 || len(email) > 254 {
+		return false
+	}
+	for _, c := range email {
+		if c == '@' {
+			return true
+		}
+	}
+	return false
 }
